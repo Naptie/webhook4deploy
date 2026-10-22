@@ -1,3 +1,76 @@
+# webhook4deploy
+
+A fork of [webhook][w] that deploys applications instead of only running
+commands, and that serves the outcome of a deployment over HTTP.
+
+A hook that carries a `deployment` section does not run a command. It
+deploys an application: it fetches the build, unpacks it, installs its
+dependencies, starts it, checks that it is healthy, and only then moves the
+traffic onto it. The deployment is recorded while it runs, so the answer to
+"did this go out, and if not, why not" can be read back at any moment.
+
+```
+GET /deployments               the deployments of this host
+GET /deployments/<run id>      one deployment, with its steps
+GET /deployments/<run id>/log  the log of one deployment
+```
+
+The configuration of an application is data, not code:
+
+```yaml
+- id: app-example
+  trigger-rule:
+    match:
+      type: value
+      value: "<the shared secret>"
+      parameter:
+        source: header
+        name: X-Webhook-Token
+  deployment:
+    app: example
+    workdir: /srv/apps/example
+    hosts: [app.example, api.app.example]
+    start: ["pm2", "start", "... PORT={port} node build", "--name", "example-{run_id}"]
+    health:
+      url: "http://127.0.0.1:{port}/"
+```
+
+See [examples/deployments.yaml](examples/deployments.yaml) for the whole
+picture.
+
+### What the tool decides on its own
+
+**The port.** Nothing in the configuration names one. The tool reads the port
+the application is currently served on out of the running configuration of
+Caddy and picks a free port from a range for the new build. The routes that
+serve the application are found by the hosts they are reached under, so a
+route that proxies to the application without naming it — a loopback alias,
+for example — is moved along with the rest.
+
+**The order.** The routing is checked before anything is started, the new
+build is checked on its port before the traffic is moved onto it, and the
+result is checked once more through the proxy after the traffic has moved. A
+build that cannot serve is rejected while production is still untouched.
+
+**The way back.** When a deployment fails after the traffic was moved, the
+tool moves it back and says so in the record.
+
+### Running it
+
+```bash
+go build -o webhook4deploy .
+./webhook4deploy -hooks ~/apps/hooks.yaml -state-dir ~/apps/deployments -verbose
+```
+
+| Flag | What it does |
+| :- | :- |
+| `-state-dir` | where the deployment records and logs are kept (default `deployments`) |
+| `-app-home` | the home directory of the user the applications belong to |
+
+Everything else is the webhook of the upstream project.
+
+---
+
 # What is webhook? ![build-status][badge]
 
  <img src="https://github.com/adnanh/webhook/raw/development/docs/logo/logo-128x128.png" alt="Webhook" align="left" />
