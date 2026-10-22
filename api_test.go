@@ -12,6 +12,9 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// theToken is the secret the deployment API is closed behind.
+const theToken = "a-shared-secret"
+
 func TestDeploymentAPIList(t *testing.T) {
 	store, err := deploy.NewStore(t.TempDir(), 10)
 	if err != nil {
@@ -19,17 +22,17 @@ func TestDeploymentAPIList(t *testing.T) {
 	}
 
 	store.Add(&deploy.Deployment{
-		ID:        "12345678901",
-		App:       "example",
-		RunID:     "12345678901",
+		ID:        "39607416602",
+		App:       "nearcade",
+		RunID:     "39607416602",
 		Status:    deploy.StatusSucceeded,
 		StartedAt: time.Now().UTC(),
 	})
 
-	server := httptest.NewServer(routesFor(store))
+	server := httptest.NewServer(routesFor(store, theToken))
 	defer server.Close()
 
-	body, code := get(t, server.URL+"/deployments")
+	body, code := get(t, server.URL+"/deployments", theToken)
 	if code != http.StatusOK {
 		t.Fatalf("the list answered with %d", code)
 	}
@@ -43,7 +46,7 @@ func TestDeploymentAPIList(t *testing.T) {
 		t.Fatalf("the list holds %d deployments, want 1", len(list))
 	}
 
-	if list[0].ID != "12345678901" || list[0].Status != deploy.StatusSucceeded {
+	if list[0].ID != "39607416602" || list[0].Status != deploy.StatusSucceeded {
 		t.Errorf("the list holds %+v", list[0])
 	}
 }
@@ -56,16 +59,16 @@ func TestDeploymentAPIGet(t *testing.T) {
 
 	store.Add(&deploy.Deployment{
 		ID:        "1",
-		App:       "example",
+		App:       "nearcade",
 		Status:    deploy.StatusFailed,
 		Reason:    "the new build did not answer",
 		StartedAt: time.Now().UTC(),
 	})
 
-	server := httptest.NewServer(routesFor(store))
+	server := httptest.NewServer(routesFor(store, theToken))
 	defer server.Close()
 
-	body, code := get(t, server.URL+"/deployments/1")
+	body, code := get(t, server.URL+"/deployments/1", theToken)
 	if code != http.StatusOK {
 		t.Fatalf("the deployment answered with %d", code)
 	}
@@ -86,11 +89,59 @@ func TestDeploymentAPIGetUnknown(t *testing.T) {
 		t.Fatalf("NewStore returned %v", err)
 	}
 
-	server := httptest.NewServer(routesFor(store))
+	server := httptest.NewServer(routesFor(store, theToken))
 	defer server.Close()
 
-	if _, code := get(t, server.URL+"/deployments/nothing"); code != http.StatusNotFound {
+	if _, code := get(t, server.URL+"/deployments/nothing", theToken); code != http.StatusNotFound {
 		t.Errorf("a deployment that does not exist answered with %d, want %d", code, http.StatusNotFound)
+	}
+}
+
+// TestDeploymentAPIIsClosed is the reason the API needs a token at all: the
+// service is reachable from the outside, and what it serves says which
+// applications the host runs.
+func TestDeploymentAPIIsClosed(t *testing.T) {
+	store, err := deploy.NewStore(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewStore returned %v", err)
+	}
+
+	server := httptest.NewServer(routesFor(store, theToken))
+	defer server.Close()
+
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{name: "without a token", token: ""},
+		{name: "with the wrong token", token: "not-the-token"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, path := range []string{"/deployments", "/deployments/1", "/deployments/1/log"} {
+				if _, code := get(t, server.URL+path, c.token); code != http.StatusUnauthorized {
+					t.Errorf("%s answered with %d, want %d", path, code, http.StatusUnauthorized)
+				}
+			}
+		})
+	}
+}
+
+// TestDeploymentAPIIsClosedWithoutAToken: when no token is configured, the
+// API is closed even for a caller who presents one. A service that forgot to
+// be configured must not serve.
+func TestDeploymentAPIIsClosedWithoutAToken(t *testing.T) {
+	store, err := deploy.NewStore(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewStore returned %v", err)
+	}
+
+	server := httptest.NewServer(routesFor(store, ""))
+	defer server.Close()
+
+	if _, code := get(t, server.URL+"/deployments", theToken); code != http.StatusUnauthorized {
+		t.Errorf("the list answered with %d, want %d", code, http.StatusUnauthorized)
 	}
 }
 
@@ -121,8 +172,8 @@ func TestExampleConfig(t *testing.T) {
 }
 
 // routesFor returns the routes of the deployment API.
-func routesFor(store *deploy.Store) *mux.Router {
-	api := &deploymentAPI{store: store}
+func routesFor(store *deploy.Store, token string) *mux.Router {
+	api := &deploymentAPI{store: store, token: token}
 
 	router := mux.NewRouter()
 	router.HandleFunc("/deployments", api.list)
@@ -132,11 +183,20 @@ func routesFor(store *deploy.Store) *mux.Router {
 	return router
 }
 
-// get asks a server for a page.
-func get(t *testing.T, url string) ([]byte, int) {
+// get asks a server for a page, presenting the token.
+func get(t *testing.T, url string, token string) ([]byte, int) {
 	t.Helper()
 
-	resp, err := http.Get(url)
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("the request could not be made: %v", err)
+	}
+
+	if token != "" {
+		request.Header.Set("X-Deployment-Token", token)
+	}
+
+	resp, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatalf("the request failed: %v", err)
 	}

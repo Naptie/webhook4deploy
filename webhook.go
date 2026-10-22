@@ -328,7 +328,7 @@ func main() {
 		Env:   deploymentEnvironment(),
 	}
 
-	api := &deploymentAPI{store: store}
+	api := &deploymentAPI{store: store, token: os.Getenv("DEPLOYMENT_API_TOKEN")}
 
 	if *debug {
 		r.Use(middleware.Dumper(log.Writer()))

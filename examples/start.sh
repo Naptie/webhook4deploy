@@ -21,6 +21,12 @@ export AWS_DEFAULT_REGION=auto
 # The address of the bucket, so that a deployment does not have to repeat it.
 export R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
+# The secret the deployment API is closed behind. The API is reachable from
+# the outside, and what it serves says which applications the host runs, so
+# it answers nobody who does not present it. When it is not set, the API is
+# closed for everyone.
+export DEPLOYMENT_API_TOKEN="${DEPLOYMENT_API_TOKEN:?the deployment API needs a token}"
+
 cd "$(dirname "$0")"
 
 # The service serves the ordinary hooks of the applications that are still
