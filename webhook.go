@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adnanh/webhook/internal/deploy"
 	"github.com/adnanh/webhook/internal/hook"
 	"github.com/adnanh/webhook/internal/middleware"
 	"github.com/adnanh/webhook/internal/pidfile"
@@ -50,6 +52,8 @@ var (
 	maxMultipartMem    = flag.Int64("max-multipart-mem", 1<<20, "maximum memory in bytes for parsing multipart form data before disk caching")
 	httpMethods        = flag.String("http-methods", "", `set default allowed HTTP methods (ie. "POST"); separate methods with comma`)
 	pidPath            = flag.String("pidfile", "", "create PID file at the given path")
+	stateDir           = flag.String("state-dir", "deployments", "directory the deployment records and logs are kept in")
+	appHome            = flag.String("app-home", "", "home directory of the user the applications belong to (defaults to the home directory of this process)")
 
 	responseHeaders hook.ResponseHeaders
 	hooksFiles      hook.HooksFiles
@@ -63,7 +67,43 @@ var (
 	setGID  = 0
 	socket  = ""
 	addr    = ""
+
+	// runner executes the deployments of the hooks that carry one.
+	runner *deploy.Runner
 )
+
+// deploymentEnvironment returns the environment the deployment commands are
+// run in, together with the placeholders the configuration can refer to.
+//
+// The commands inherit the environment of the service, so the credentials the
+// artifact is fetched with are the ones the service was started with. The
+// bucket and its endpoint are given shorter names, so a deployment does not
+// have to repeat them.
+func deploymentEnvironment() map[string]string {
+	env := map[string]string{}
+
+	for _, entry := range os.Environ() {
+		if i := strings.IndexByte(entry, '='); i > 0 {
+			env[entry[:i]] = entry[i+1:]
+		}
+	}
+
+	if bucket := env["R2_BUCKET"]; bucket != "" {
+		env["bucket"] = bucket
+	}
+
+	endpoint := env["R2_ENDPOINT"]
+	if endpoint == "" {
+		if account := env["R2_ACCOUNT_ID"]; account != "" {
+			endpoint = "https://" + account + ".r2.cloudflarestorage.com"
+		}
+	}
+	if endpoint != "" {
+		env["endpoint"] = endpoint
+	}
+
+	return env
+}
 
 func matchLoadedHook(id string) *hook.Hook {
 	for _, hooks := range loadedHooksFromFiles {
@@ -268,6 +308,28 @@ func main() {
 	r.Use(middleware.NewLogger())
 	r.Use(chimiddleware.Recoverer)
 
+	// The deployment records and logs live in a directory of their own, and
+	// they survive a restart of the service.
+	home := *appHome
+	if home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			home = h
+		}
+	}
+
+	store, err := deploy.NewStore(*stateDir, 50)
+	if err != nil {
+		log.Fatalf("error preparing the deployment state: %v", err)
+	}
+
+	runner = &deploy.Runner{
+		Store: store,
+		Home:  home,
+		Env:   deploymentEnvironment(),
+	}
+
+	api := &deploymentAPI{store: store}
+
 	if *debug {
 		r.Use(middleware.Dumper(log.Writer()))
 	}
@@ -286,6 +348,11 @@ func main() {
 	})
 
 	r.HandleFunc(hooksURL, hookHandler)
+
+	// The deployment API: what the deployments did, and why they failed.
+	r.HandleFunc("/deployments", api.list)
+	r.HandleFunc("/deployments/{id}", api.get)
+	r.HandleFunc("/deployments/{id}/log", api.log)
 
 	// Create common HTTP server settings
 	svr := &http.Server{
@@ -518,6 +585,33 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 
 		for _, responseHeader := range matchedHook.ResponseHeaders {
 			w.Header().Set(responseHeader.Name, responseHeader.Value)
+		}
+
+		// A hook that carries a deployment does not run a command: it deploys
+		// an application the way its specification describes. The deployment
+		// runs in the background, and its outcome is read back over the
+		// deployment API.
+		if matchedHook.Deployment != nil {
+			if err := matchedHook.Deployment.Validate(); err != nil {
+				log.Printf("[%s] the deployment of %s is not usable: %v\n", req.ID, matchedHook.ID, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, "The deployment of this hook is not usable.")
+				return
+			}
+
+			payload, err := deploy.ParsePayload(req.Payload)
+			if err != nil {
+				log.Printf("[%s] the request for %s does not carry a deployment: %v\n", req.ID, matchedHook.ID, err)
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, "The request does not carry a deployment.")
+				return
+			}
+
+			log.Printf("[%s] starting the deployment %s of %s\n", req.ID, payload.RunID, matchedHook.Deployment.App)
+			go runner.Run(context.Background(), matchedHook.Deployment, payload)
+
+			fmt.Fprint(w, matchedHook.ResponseMessage)
+			return
 		}
 
 		if matchedHook.CaptureCommandOutput {

@@ -2,5 +2,6 @@
 .cover
 coverage
 webhook
+webhook4deploy
 /test/hookecho
 build

@@ -1,0 +1,157 @@
+# An example of the hooks file of a deployment host.
+#
+# A hook that carries a "deployment" section does not run a command: it
+# deploys an application the way the section describes, and the outcome of
+# the deployment is recorded and served over the deployment API:
+#
+#   GET /deployments              the deployments of this host
+#   GET /deployments/<run id>     one deployment, with its steps
+#   GET /deployments/<run id>/log the log of one deployment
+#
+# The trigger rule is the same as the one of a plain hook: the request has to
+# carry the shared secret, otherwise the deployment is not started. The secret
+# belongs in a file that is not in the repository.
+#
+# The payload of the request is the one the publish workflow sends:
+#
+#   {"run_id": "12345678901", "source": "r2", "object_key": "example/12345678901/build.zip"}
+#
+# An application that is always served on the same port needs a "stop" step
+# and no "caddy" section: the old process is stopped before the new one is
+# started, and there is no traffic to move.
+
+- id: app-example
+  trigger-rule:
+    match:
+      type: value
+      value: "<the shared secret>"
+      parameter:
+        source: header
+        name: X-Webhook-Token
+  deployment:
+    app: example
+    repo: owner/repository
+    source: r2
+    object-key: "example/{run_id}/build.zip"
+    workdir: /srv/apps/example
+
+    # The dependencies of the build are installed in the directory the build
+    # was unpacked into.
+    install: ["pnpm", "install", "--prod", "--frozen-lockfile"]
+
+    # The application is started on a free port. The tool picks the port and
+    # tells the proxy about it, so nothing here names one.
+    start:
+      - pm2
+      - start
+      - "~/utils/start.sh ../.env env NODE_ENV=production HOST=127.0.0.1 PORT={port} node build"
+      - --name
+      - "example-{run_id}"
+      - --log-date-format
+      - "YYYY-MM-DD HH:mm:ss"
+
+    health:
+      url: "http://127.0.0.1:{port}/"
+      attempts: 20
+      interval-seconds: 2
+      timeout-seconds: 5
+
+    caddy:
+      # The hosts the application is served under. The routes of these hosts
+      # are found in the running configuration of the proxy, and every route
+      # that proxies to the same address without naming the application is
+      # moved along with them.
+      hosts:
+        - app.example
+        - api.app.example
+      # The address the routes proxy to. The port is filled in by the tool.
+      dial: "localhost:{port}"
+      # The port for a new build is taken from this range.
+      port-range: [7000, 7100]
+      # The live port is written into the configuration file of the proxy and
+      # the proxy is reloaded, so the deployment survives a restart of it.
+      persist:
+        - ["sudo", "sed", "-i", "s/localhost:{active_port}/localhost:{port}/g", "/etc/caddy/Caddyfile"]
+        - ["sudo", "systemctl", "reload", "caddy"]
+
+    # The routing is checked before anything is started. These checks describe
+    # the configuration of the proxy, not the application, so a failure here is
+    # not the fault of the deployment.
+    verify-routing:
+      # The /api routes of one host reach the application rather than being
+      # redirected to the canonical host.
+      - url: "http://localhost/api/health"
+        host: "api.app.example"
+        not-status: [301, 302]
+      # And the canonical host itself is the one that is redirected to.
+      - url: "http://localhost/"
+        host: "www.app.example"
+        status: [301]
+
+    # The new build is checked on the staging port, before the traffic is
+    # moved onto it.
+    verify-build:
+      - url: "http://127.0.0.1:{port}/"
+        host: "app.example"
+        headers:
+          X-Forwarded-Proto: "https"
+          Accept-Encoding: "identity"
+        status: [200]
+
+    # The one check that needs the traffic to have been moved: it catches a
+    # build that answers on its own port but not as it is served.
+    verify-live:
+      - url: "http://localhost/"
+        host: "app.example"
+        status: [200]
+
+    # The processes of an older deployment are removed once the new one is
+    # live, so that the two do not run side by side.
+    process-prefix: "example"
+
+    # The background workers of the new deployment.
+    workers:
+      - ["pm2", "start", "~/utils/start.sh ../.env node ./scripts/worker.js", "--name", "example-{run_id}-worker", "--log-date-format", "YYYY-MM-DD HH:mm:ss"]
+
+    # The old deployment is removed once the new one is live.
+    finalize:
+      - ["sh", "-c", "find . -maxdepth 1 -type d -name 'run-*' ! -name 'run-{run_id}' -exec rm -rf -- {} +"]
+      - ["pm2", "save"]
+
+# --- an application that is always served on the same port ------------------
+#
+# The old process is stopped before the new one is started, and there is no
+# traffic to move.
+- id: app-worker
+  trigger-rule:
+    match:
+      type: value
+      value: "<the shared secret>"
+      parameter:
+        source: header
+        name: X-Webhook-Token
+  deployment:
+    app: worker
+    repo: owner/repository
+    source: github
+    # How the artifact of a GitHub Actions run is fetched is not something the
+    # tool knows: the helper that does it lives on the host.
+    fetch: ["node", "/srv/webhook/artifact-helper.js", "{repo}", "{run_id}"]
+    workdir: /srv/apps/worker
+    install: ["bun", "install", "--frozen-lockfile", "--production"]
+    stop: [["pm2", "del", "worker"]]
+    start:
+      - pm2
+      - start
+      - "~/utils/start.sh ../.env bun ./index.js"
+      - --name
+      - worker
+      - --log-date-format
+      - "YYYY-MM-DD HH:mm:ss"
+    health:
+      url: "http://127.0.0.1:8080/"
+      attempts: 20
+      interval-seconds: 2
+      timeout-seconds: 5
+    finalize:
+      - ["pm2", "save"]

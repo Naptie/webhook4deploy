@@ -20,6 +20,8 @@ import (
 	"os"
 	"path"
 	"reflect"
+
+	"github.com/adnanh/webhook/internal/deploy"
 	"regexp"
 	"strconv"
 	"strings"
@@ -581,6 +583,11 @@ type Hook struct {
 	IncomingPayloadContentType          string          `json:"incoming-payload-content-type,omitempty"`
 	SuccessHttpResponseCode             int             `json:"success-http-response-code,omitempty"`
 	HTTPMethods                         []string        `json:"http-methods"`
+	// Deployment turns the hook into a deployment. When it is set, the hook
+	// does not run a command: it deploys an application the way the
+	// specification describes, and the outcome of the deployment is recorded
+	// and served over the deployment API.
+	Deployment *deploy.Spec `json:"deployment,omitempty"`
 }
 
 // ParseJSONParameters decodes specified arguments to JSON objects and replaces the
